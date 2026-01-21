@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "HTTP Repeater",
+  "version": "1.0",
+  "description": "HTTP request repeater for Chrome DevTools",
+  "devtools_page": "devtools.html",
+  "permissions": [
+    "webRequest"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  },
+  "icons": {
+    "16": "icon.png",
+    "48": "icon.png",
+    "128": "icon.png"
+  }
+}
