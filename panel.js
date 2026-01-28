@@ -1,57 +1,85 @@
 const { useState, useEffect } = React;
 
 function HTTPRepeater() {
+  // --- STATE: HTTP REPEATER ---
   const [request, setRequest] = useState({
     method: 'GET',
     url: 'https://httpbin.org/get',
     headers: 'User-Agent: Mozilla/5.0\nAccept: application/json',
     body: ''
   });
-  
   const [response, setResponse] = useState(null);
   const [loading, setLoading] = useState(false);
   const [capturedRequests, setCapturedRequests] = useState([]);
 
+  // --- STATE: JS ANALYZER (REP+) ---
+  const [scripts, setScripts] = useState([]);
+  const [activeTab, setActiveTab] = useState('requests'); // 'requests' or 'analyzer'
+
+  // --- LOGIC: JS ANALYZER ---
+  const analyzeScripts = () => {
+    if (!chrome.devtools || !chrome.devtools.inspectedWindow) return;
+
+    chrome.devtools.inspectedWindow.getResources((resources) => {
+      // Filter for scripts only
+      const jsResources = resources.filter(res => res.type === 'script' || res.url.endsWith('.js'));
+      
+      const analysisPromises = jsResources.map(res => {
+        return new Promise((resolve) => {
+          res.getContent((content) => {
+            if (!content) return resolve(null);
+            
+            const issues = [];
+            // Security "Vibe Check" Patterns
+            if (/eval\(|setTimeout\(.*['"].*['"]\)/.test(content)) issues.push("⚠️ Dangerous Execution (eval)");
+            if (/(innerHTML|outerHTML|document\.write)/.test(content)) issues.push("⚠️ DOM XSS Sink Found");
+            if (/(AIza[0-9A-Za-z-_]{35})/.test(content)) issues.push("🚨 Google API Key Leak");
+            if (/(sk-[a-zA-Z0-9]{48})/.test(content)) issues.push("🚨 OpenAI Key Leak");
+            if (/(?:aws_access_key_id|aws_secret_access_key)/i.test(content)) issues.push("🚨 AWS Credentials?");
+            if (/firebaseio\.com/.test(content)) issues.push("ℹ️ Firebase URL Found");
+
+            resolve({
+              url: res.url.split('/').pop() || 'inline-script',
+              fullUrl: res.url,
+              issues: issues,
+              vibe: issues.length === 0 ? 'Clean' : 'Sketchy'
+            });
+          });
+        });
+      });
+
+      Promise.all(analysisPromises).then(results => {
+        setScripts(results.filter(r => r !== null));
+      });
+    });
+  };
+
+  // --- EFFECTS ---
   useEffect(() => {
-    // Listen for network requests
+    // 1. Listen for network requests for the Repeater
     if (chrome.devtools && chrome.devtools.network) {
       chrome.devtools.network.onRequestFinished.addListener((req) => {
-        // Store captured request
         const captured = {
           id: Date.now() + Math.random(),
           method: req.request.method,
           url: req.request.url,
           timestamp: new Date().toLocaleTimeString()
         };
-        
-        setCapturedRequests(prev => [captured, ...prev].slice(0, 50)); // Keep last 50
+        setCapturedRequests(prev => [captured, ...prev].slice(0, 50));
+      });
+
+      // 2. Re-run analyzer on page navigation
+      chrome.devtools.network.onNavigated.addListener(() => {
+        analyzeScripts();
       });
     }
+    
+    // Initial scan
+    analyzeScripts();
   }, []);
 
-  const loadCapturedRequest = async (capturedReq) => {
-    // Get full request details
-    chrome.devtools.network.onRequestFinished.addListener(async (req) => {
-      if (req.request.url === capturedReq.url) {
-        const headers = req.request.headers
-          .map(h => `${h.name}: ${h.value}`)
-          .join('\n');
-        
-        let body = '';
-        if (req.request.postData) {
-          body = req.request.postData.text || '';
-        }
-        
-        setRequest({
-          method: req.request.method,
-          url: req.request.url,
-          headers: headers,
-          body: body
-        });
-      }
-    });
-    
-    // Fallback: basic population
+  // --- HANDLERS ---
+  const loadCapturedRequest = (capturedReq) => {
     setRequest({
       method: capturedReq.method,
       url: capturedReq.url,
@@ -63,21 +91,14 @@ function HTTPRepeater() {
   const sendRequest = async () => {
     setLoading(true);
     setResponse(null);
-    
     try {
       const headers = {};
       request.headers.split('\n').forEach(line => {
         const [key, ...values] = line.split(':');
-        if (key && values.length) {
-          headers[key.trim()] = values.join(':').trim();
-        }
+        if (key && values.length) headers[key.trim()] = values.join(':').trim();
       });
 
-      const options = {
-        method: request.method,
-        headers
-      };
-
+      const options = { method: request.method, headers };
       if (request.body && ['POST', 'PUT', 'PATCH'].includes(request.method)) {
         options.body = request.body;
       }
@@ -87,13 +108,10 @@ function HTTPRepeater() {
       const endTime = performance.now();
       
       const responseHeaders = {};
-      res.headers.forEach((value, key) => {
-        responseHeaders[key] = value;
-      });
+      res.headers.forEach((v, k) => responseHeaders[k] = v);
 
       let responseBody;
       const contentType = res.headers.get('content-type') || '';
-      
       if (contentType.includes('application/json')) {
         responseBody = JSON.stringify(await res.json(), null, 2);
       } else {
@@ -108,45 +126,17 @@ function HTTPRepeater() {
         time: Math.round(endTime - startTime)
       });
     } catch (err) {
-      setResponse({
-        status: 0,
-        statusText: 'Error',
-        headers: {},
-        body: err.message,
-        time: 0
-      });
+      setResponse({ status: 0, statusText: 'Error', headers: {}, body: err.message, time: 0 });
     }
-    
     setLoading(false);
   };
 
-  const copyResponse = () => {
-    if (response) {
-      navigator.clipboard.writeText(response.body);
-    }
-  };
-
-  const clearAll = () => {
-    setResponse(null);
-    setRequest({
-      method: 'GET',
-      url: '',
-      headers: '',
-      body: ''
-    });
-  };
-
-  return React.createElement('div', { className: 'h-screen flex bg-gray-900 text-gray-100' },
-    // Sidebar for captured requests
-    React.createElement('div', { className: 'w-64 border-r border-gray-700 flex flex-col' },
-      React.createElement('div', { className: 'p-3 bg-gray-800 border-b border-gray-700 font-semibold text-sm' }, 
-        'Captured Requests'
-      ),
-      React.createElement('div', { className: 'flex-1 overflow-auto' },
+  // --- UI COMPONENTS ---
+  const renderSidebarContent = () => {
+    if (activeTab === 'requests') {
+      return React.createElement('div', { className: 'flex-1 overflow-auto' },
         capturedRequests.length === 0 
-          ? React.createElement('div', { className: 'p-4 text-center text-gray-500 text-sm' },
-              'Browse websites to capture requests'
-            )
+          ? React.createElement('div', { className: 'p-4 text-center text-gray-500 text-sm' }, 'Browse to capture requests')
           : capturedRequests.map(req =>
               React.createElement('div', {
                 key: req.id,
@@ -154,132 +144,104 @@ function HTTPRepeater() {
                 className: 'p-3 border-b border-gray-800 hover:bg-gray-800 cursor-pointer'
               },
                 React.createElement('div', { className: 'flex items-center gap-2 mb-1' },
-                  React.createElement('span', { 
-                    className: `px-2 py-0.5 text-xs font-semibold rounded ${
-                      req.method === 'GET' ? 'bg-blue-900 text-blue-200' :
-                      req.method === 'POST' ? 'bg-green-900 text-green-200' :
-                      'bg-yellow-900 text-yellow-200'
-                    }`
-                  }, req.method),
-                  React.createElement('span', { className: 'text-xs text-gray-500' }, req.timestamp)
+                  React.createElement('span', { className: `px-2 py-0.5 text-[10px] font-bold rounded ${req.method === 'GET' ? 'bg-blue-900 text-blue-200' : 'bg-green-900 text-green-200'}` }, req.method),
+                  React.createElement('span', { className: 'text-[10px] text-gray-500' }, req.timestamp)
                 ),
-                React.createElement('div', { className: 'text-xs text-gray-300 truncate' }, 
-                  new URL(req.url).pathname || '/'
-                ),
-                React.createElement('div', { className: 'text-xs text-gray-500 truncate' }, 
-                  new URL(req.url).hostname
-                )
+                React.createElement('div', { className: 'text-[11px] text-gray-300 truncate' }, new URL(req.url).pathname),
+                React.createElement('div', { className: 'text-[10px] text-gray-500 truncate' }, new URL(req.url).hostname)
               )
             )
-      )
+      );
+    } else {
+      return React.createElement('div', { className: 'flex-1 overflow-auto' },
+        React.createElement('button', { 
+          onClick: analyzeScripts,
+          className: 'w-full p-2 bg-indigo-900 hover:bg-indigo-800 text-xs font-bold' 
+        }, 'RE-SCAN SCRIPTS'),
+        scripts.map((s, i) => React.createElement('div', { key: i, className: 'p-3 border-b border-gray-800' },
+          React.createElement('div', { 
+            className: 'text-[11px] font-bold truncate text-blue-400 cursor-help',
+            title: s.fullUrl 
+          }, s.url),
+          s.issues.length > 0 
+            ? s.issues.map((issue, idx) => React.createElement('div', { key: idx, className: 'text-[10px] text-red-400 mt-1' }, issue))
+            : React.createElement('div', { className: 'text-[10px] text-green-500 mt-1' }, '✓ Clean Vibe')
+        ))
+      );
+    }
+  };
+
+  return React.createElement('div', { className: 'h-screen flex bg-gray-900 text-gray-100 font-sans' },
+    // Sidebar
+    React.createElement('div', { className: 'w-64 border-r border-gray-700 flex flex-col bg-gray-900' },
+      React.createElement('div', { className: 'flex border-b border-gray-700' },
+        React.createElement('button', { 
+          onClick: () => setActiveTab('requests'),
+          className: `flex-1 p-3 text-[10px] font-bold tracking-wider ${activeTab === 'requests' ? 'bg-gray-800 border-b-2 border-orange-500' : 'text-gray-500'}`
+        }, 'REQUESTS'),
+        React.createElement('button', { 
+          onClick: () => { setActiveTab('analyzer'); analyzeScripts(); },
+          className: `flex-1 p-3 text-[10px] font-bold tracking-wider ${activeTab === 'analyzer' ? 'bg-gray-800 border-b-2 border-indigo-500' : 'text-gray-500'}`
+        }, 'JS ANALYZER (REP+)')
+      ),
+      renderSidebarContent()
     ),
     
-    // Main content
+    // Main Panel (Repeater)
     React.createElement('div', { className: 'flex-1 flex flex-col' },
       React.createElement('div', { className: 'flex items-center justify-between p-4 bg-gray-800 border-b border-gray-700' },
-        React.createElement('h1', { className: 'text-xl font-bold' }, 'HTTP Repeater'),
-        React.createElement('div', { className: 'flex gap-2' },
-          React.createElement('button', {
-            onClick: () => setCapturedRequests([]),
-            className: 'px-3 py-1 bg-gray-700 hover:bg-gray-600 rounded text-sm'
-          }, 'Clear History'),
-          React.createElement('button', {
-            onClick: clearAll,
-            className: 'px-3 py-1 bg-gray-700 hover:bg-gray-600 rounded flex items-center gap-2'
-          }, '🗑 Clear')
-        )
+        React.createElement('h1', { className: 'text-lg font-bold text-orange-500' }, 'REP+ REPEATER'),
+        React.createElement('button', { onClick: () => setResponse(null), className: 'text-xs text-gray-400 hover:text-white' }, 'Reset')
       ),
-
+      
       React.createElement('div', { className: 'flex-1 flex overflow-hidden' },
+        // Request Column
         React.createElement('div', { className: 'w-1/2 flex flex-col border-r border-gray-700' },
-          React.createElement('div', { className: 'p-4 bg-gray-800 border-b border-gray-700' },
-            React.createElement('div', { className: 'flex gap-2 mb-3' },
+          React.createElement('div', { className: 'p-4 bg-gray-800/50' },
+            React.createElement('div', { className: 'flex gap-2' },
               React.createElement('select', {
                 value: request.method,
                 onChange: (e) => setRequest({...request, method: e.target.value}),
-                className: 'px-3 py-2 bg-gray-700 rounded border border-gray-600'
-              },
-                React.createElement('option', null, 'GET'),
-                React.createElement('option', null, 'POST'),
-                React.createElement('option', null, 'PUT'),
-                React.createElement('option', null, 'DELETE'),
-                React.createElement('option', null, 'PATCH'),
-                React.createElement('option', null, 'OPTIONS'),
-                React.createElement('option', null, 'HEAD')
-              ),
+                className: 'px-2 py-1 bg-gray-700 rounded text-xs'
+              }, ['GET', 'POST', 'PUT', 'DELETE'].map(m => React.createElement('option', {key: m}, m))),
               React.createElement('input', {
-                type: 'text',
                 value: request.url,
                 onChange: (e) => setRequest({...request, url: e.target.value}),
-                placeholder: 'https://example.com/api',
-                className: 'flex-1 px-3 py-2 bg-gray-700 rounded border border-gray-600'
+                className: 'flex-1 px-3 py-1 bg-gray-700 rounded text-xs border border-gray-600'
               }),
               React.createElement('button', {
                 onClick: sendRequest,
-                disabled: loading || !request.url,
-                className: 'px-4 py-2 bg-orange-600 hover:bg-orange-700 disabled:bg-gray-600 rounded flex items-center gap-2'
-              }, '→ Send')
+                className: 'px-4 py-1 bg-orange-600 hover:bg-orange-700 rounded text-xs font-bold'
+              }, 'SEND')
             )
           ),
-          React.createElement('div', { className: 'flex-1 flex flex-col overflow-hidden' },
-            React.createElement('div', { className: 'px-4 py-2 bg-gray-800 text-sm font-semibold' }, 'Headers'),
-            React.createElement('textarea', {
-              value: request.headers,
-              onChange: (e) => setRequest({...request, headers: e.target.value}),
-              className: 'flex-1 p-4 bg-gray-900 border-b border-gray-700 font-mono text-sm resize-none',
-              placeholder: 'Header-Name: value'
-            }),
-            ['POST', 'PUT', 'PATCH'].includes(request.method) && React.createElement(React.Fragment, null,
-              React.createElement('div', { className: 'px-4 py-2 bg-gray-800 text-sm font-semibold' }, 'Body'),
-              React.createElement('textarea', {
-                value: request.body,
-                onChange: (e) => setRequest({...request, body: e.target.value}),
-                className: 'flex-1 p-4 bg-gray-900 font-mono text-sm resize-none',
-                placeholder: '{"key": "value"}'
-              })
-            )
-          )
+          React.createElement('textarea', {
+            value: request.headers,
+            onChange: (e) => setRequest({...request, headers: e.target.value}),
+            className: 'flex-1 p-4 bg-gray-900 font-mono text-xs resize-none border-b border-gray-700',
+            placeholder: 'Headers...'
+          }),
+          ['POST', 'PUT'].includes(request.method) && React.createElement('textarea', {
+            value: request.body,
+            onChange: (e) => setRequest({...request, body: e.target.value}),
+            className: 'h-1/3 p-4 bg-gray-900 font-mono text-xs resize-none',
+            placeholder: 'Body...'
+          })
         ),
-        React.createElement('div', { className: 'w-1/2 flex flex-col bg-gray-900' },
+        
+        // Response Column
+        React.createElement('div', { className: 'w-1/2 flex flex-col' },
           response ? React.createElement(React.Fragment, null,
-            React.createElement('div', { className: 'p-4 bg-gray-800 border-b border-gray-700 flex items-center justify-between' },
-              React.createElement('div', { className: 'flex items-center gap-4' },
-                React.createElement('span', {
-                  className: `px-2 py-1 rounded text-sm font-semibold ${
-                    response.status >= 200 && response.status < 300 ? 'bg-green-900 text-green-200' :
-                    response.status >= 400 ? 'bg-red-900 text-red-200' :
-                    'bg-yellow-900 text-yellow-200'
-                  }`
-                }, `${response.status} ${response.statusText}`),
-                React.createElement('span', { className: 'text-sm text-gray-400' }, `${response.time}ms`)
-              ),
-              React.createElement('button', {
-                onClick: copyResponse,
-                className: 'px-3 py-1 bg-gray-700 hover:bg-gray-600 rounded flex items-center gap-2'
-              }, '⎘ Copy')
+            React.createElement('div', { className: 'p-2 bg-gray-800 flex gap-4 text-[10px] font-bold' },
+              React.createElement('span', { className: response.status < 400 ? 'text-green-400' : 'text-red-400' }, `STATUS: ${response.status}`),
+              React.createElement('span', { className: 'text-gray-400' }, `TIME: ${response.time}ms`)
             ),
-            React.createElement('div', { className: 'px-4 py-2 bg-gray-800 text-sm font-semibold' }, 'Response Headers'),
-            React.createElement('div', { className: 'p-4 bg-gray-900 border-b border-gray-700 font-mono text-sm' },
-              Object.entries(response.headers).map(([key, value]) =>
-                React.createElement('div', { key: key, className: 'text-gray-300' },
-                  React.createElement('span', { className: 'text-blue-400' }, key), ': ', value
-                )
-              )
-            ),
-            React.createElement('div', { className: 'px-4 py-2 bg-gray-800 text-sm font-semibold' }, 'Response Body'),
-            React.createElement('pre', { className: 'flex-1 p-4 overflow-auto font-mono text-sm text-gray-300' },
-              response.body
-            )
-          ) : React.createElement('div', { className: 'flex-1 flex items-center justify-center text-gray-500' },
-            loading ? 'Sending request...' : 'Send a request to see the response'
-          )
+            React.createElement('pre', { className: 'flex-1 p-4 overflow-auto font-mono text-xs text-gray-300' }, response.body)
+          ) : React.createElement('div', { className: 'flex-1 flex items-center justify-center text-gray-600 text-sm' }, loading ? 'Vibing with the server...' : 'No Response Yet')
         )
       )
     )
   );
 }
 
-ReactDOM.render(
-  React.createElement(HTTPRepeater),
-  document.getElementById('root')
-);
+ReactDOM.render(React.createElement(HTTPRepeater), document.getElementById('root'));
